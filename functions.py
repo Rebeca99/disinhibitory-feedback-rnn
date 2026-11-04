@@ -167,6 +167,24 @@ def get_default_hp():
             'no_srsst_to_srvip': False,
             'sr_sst_high_bias': False,
             'fdbk_to_vip': False,
+            'prev_rew_to_pfc_default': True,
+            'prev_rew_to_pfc_vip': False,
+            'prev_rew_to_sr_vip': False,
+            'prev_rew_negative_only_to_vip': False,
+            'prev_rew_to_pfc_scale': 1.0,
+            'prev_rew_to_vip_scale': 1.0,
+            'warm_start_vip_feedback_init': 0.0,
+            'feedback_noise_mode': 'none',
+            'feedback_noise_prob': 0.0,
+            'feedback_noise_flip_fraction': 0.5,
+            'train_switch_mode': 'fixed_n',
+            'test_switch_mode': 'fixed_interval',
+            'stochastic_min_block_len': 10,
+            'stochastic_max_block_len': 35,
+            'stochastic_switch_prob': 0.08,
+            'test_stochastic_min_block_len': 10,
+            'test_stochastic_max_block_len': 35,
+            'test_stochastic_switch_prob': 0.08,
             'exc_to_vip': False,
             'dend_nonlinearity': 'old',    # old, v2, v3
             'trainable_dend2soma': False,
@@ -191,7 +209,15 @@ def get_default_hp():
             'bpx1tr': False,
             'record_recent_rnn_activity': False,
             'check_explode_cg': False,
-            'scale_down_wexc_init': True    # scale down the outgoing weights from exc cells at initialization to prevent exploding dynamics
+            'scale_down_wexc_init': True,    # scale down the outgoing weights from exc cells at initialization to prevent exploding dynamics
+            'training_root': None,
+            'saved_models_dir': None,
+            'saved_checkpoints_dir': None,
+            'checkpoint_interval': 10,
+            'max_train_batches': int(1e5),
+            'max_runtime_seconds': None,
+            'test_n_trials': 200,
+            'test_switch_every': 20,
             }
     
     
@@ -441,6 +467,85 @@ def smooth(x, window_size=50):
     
     
     
+def apply_feedback_noise(last_rew, hp):
+    """Return the observed previous-feedback signal after optional corruption."""
+    if last_rew is None:
+        return None
+
+    mode = hp.get('feedback_noise_mode', 'none')
+    prob = float(hp.get('feedback_noise_prob', 0.0) or 0.0)
+    if mode in ['none', None] or prob <= 0:
+        return last_rew
+    if prob > 1:
+        raise ValueError('feedback_noise_prob must be in [0, 1]')
+
+    true_rew = last_rew.detach().bool()
+    corrupt = torch.rand(true_rew.shape, device=true_rew.device) < prob
+
+    if mode == 'flip':
+        return torch.where(corrupt, ~true_rew, true_rew)
+
+    rew_channels = torch.stack([true_rew.float(), (~true_rew).float()], dim=1)
+    if mode == 'dropout':
+        rew_channels[corrupt, :] = 0
+        return rew_channels
+
+    if mode == 'mixed':
+        flip_fraction = float(hp.get('feedback_noise_flip_fraction', 0.5))
+        if flip_fraction < 0 or flip_fraction > 1:
+            raise ValueError('feedback_noise_flip_fraction must be in [0, 1]')
+        flip = corrupt & (torch.rand(true_rew.shape, device=true_rew.device) < flip_fraction)
+        drop = corrupt & ~flip
+        observed = torch.where(flip, ~true_rew, true_rew)
+        rew_channels = torch.stack([observed.float(), (~observed).float()], dim=1)
+        rew_channels[drop, :] = 0
+        return rew_channels
+
+    raise ValueError('feedback_noise_mode not recognized: {}'.format(mode))
+
+
+def sample_stochastic_switch_trials(n_trials, min_block_len=10, max_block_len=35, switch_prob=0.08):
+    """Sample hidden-rule switches as first-trial indices of new blocks.
+
+    The model is not cued about these switches. The returned values follow the
+    convention used by test_frozen_weights: trial t is the first trial after a
+    hidden rule switch. Training code converts these to "switch after trial"
+    indices by subtracting one.
+    """
+    n_trials = int(n_trials)
+    min_block_len = int(min_block_len)
+    max_block_len = int(max_block_len) if max_block_len is not None else n_trials
+    switch_prob = float(switch_prob)
+
+    if n_trials <= 1:
+        return []
+    if min_block_len < 1:
+        raise ValueError('stochastic min_block_len must be >= 1')
+    if max_block_len < min_block_len:
+        raise ValueError('stochastic max_block_len must be >= min_block_len')
+    if switch_prob < 0 or switch_prob > 1:
+        raise ValueError('stochastic switch_prob must be in [0, 1]')
+
+    switch_trials = []
+    block_start = 0
+    while block_start + min_block_len < n_trials:
+        block_len = min_block_len
+        while block_start + block_len < n_trials:
+            if block_len >= max_block_len:
+                break
+            if random.random() < switch_prob:
+                break
+            block_len += 1
+
+        switch_trial = block_start + block_len
+        if switch_trial >= n_trials:
+            break
+        switch_trials.append(switch_trial)
+        block_start = switch_trial
+
+    return switch_trials
+
+
 def compute_trial_history(last_rew, prev_stim, prev_choice, input_period, batch_size, n_steps, input_dim, stim_start, stim_end, dt, choice_dim=2):
     """ Compute the input for trial history """
     
@@ -448,10 +553,14 @@ def compute_trial_history(last_rew, prev_stim, prev_choice, input_period, batch_
 #     I_prev_rew = torch.zeros([batch_size, 2, n_steps]).to(model.rnn.w_rec.device)
     I_prev_rew = torch.zeros([n_steps, batch_size, 2])
         
-    if last_rew!=None:
+    if last_rew is not None:
         # test: does pytorch broadcast? 
 #         print('last_rew shape: {}'.format(last_rew.shape), flush=True)
-        rew = torch.outer(last_rew.cpu().float(), torch.Tensor([1,0])) + torch.outer((~last_rew).cpu().float(), torch.Tensor([0,1]))
+        if torch.is_tensor(last_rew) and last_rew.dim()==2 and last_rew.shape[1]==2:
+            rew = last_rew.detach().cpu().float()
+        else:
+            last_rew = last_rew.detach().bool()
+            rew = torch.outer(last_rew.cpu().float(), torch.Tensor([1,0])) + torch.outer((~last_rew).cpu().float(), torch.Tensor([0,1]))
         rew = torch.unsqueeze(rew, 0)
 #         I_prev_rew[:,:,input_period] = rew
 #         print('I_prev_rew shape: {}, rew shape: {}'.format(I_prev_rew.shape, rew.shape), flush=True)
@@ -560,7 +669,7 @@ def plot_y_yhat(y, yhat, dt=10, switch_tsteps=[]):
         
         
         
-def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, task, delay_var=0, reset_network=False, give_prev_stim=True, give_prev_choice=True, give_prev_rew=True, plot=False, tr_type_after_switch='n/a', tr_type_otherwise='n/a', toprint=True, noiseless=False, random_switch=False, n_switches=10, switch_every_test=10, change_iti=False, iti=100, opto=None):
+def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, task, delay_var=0, reset_network=False, give_prev_stim=True, give_prev_choice=True, give_prev_rew=True, plot=False, tr_type_after_switch='n/a', tr_type_otherwise='n/a', toprint=True, noiseless=False, random_switch=False, n_switches=10, switch_every_test=10, change_iti=False, iti=100, opto=None, switch_mode=None):
     """ delay_var: variability in the delay duration """
     
     start = time.time()
@@ -586,13 +695,26 @@ def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, 
         raise ValueError('initial rule not in rule list!')
     
     # when to switch
-    if random_switch==False:
+    if switch_mode is None:
+        switch_mode = 'random_fixed_n' if random_switch==True else hp.get('test_switch_mode', 'fixed_interval')
+    if switch_mode == 'fixed_interval' and random_switch==False:
         print('non-random switch')
         switch_trials = np.arange(0, n_trials_test, switch_every_test)
-    elif random_switch==True:
+    elif switch_mode == 'random_fixed_n' or random_switch==True:
         print('random switch')
 #         switch_trials = random.sample(range(n_trials_test-1), n_switches)
         switch_trials = [(3-1)*i + x for i, x in enumerate(sorted(random.sample(range(n_trials_test-(3-1)*(n_switches-1)), n_switches)))]    # make sure rule switches have a minimal distance of 3 trials see https://stackoverflow.com/questions/51918580/python-random-list-of-numbers-in-a-range-keeping-with-a-minimum-distance
+    elif switch_mode == 'stochastic_hazard':
+        print('stochastic hidden switch')
+        switch_trials = sample_stochastic_switch_trials(
+            n_trials=n_trials_test,
+            min_block_len=hp.get('test_stochastic_min_block_len', hp.get('stochastic_min_block_len', 10)),
+            max_block_len=hp.get('test_stochastic_max_block_len', hp.get('stochastic_max_block_len', 35)),
+            switch_prob=hp.get('test_stochastic_switch_prob', hp.get('stochastic_switch_prob', 0.08)),
+        )
+        n_switches = len(switch_trials)
+    else:
+        raise ValueError('switch_mode not recognized: {}'.format(switch_mode))
 #     print('# trials for testing={}, switch_trials = {}'.format(n_trials_test, switch_trials))
     
     last_switch = 0
@@ -692,8 +814,9 @@ def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, 
             elif hp_copy['task']=='wcst':
                 ts_prev_stim_start = hp_task_var_delay['test_cards_on']    # here the center card is still shown
                 ts_prev_stim_end = hp_task_var_delay['test_cards_off']
+            observed_last_rew = apply_feedback_noise(last_rew, hp_copy)
             if hp_copy['task']=='cxtdm':
-                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=last_rew, prev_stim=prev_stim, 
+                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=observed_last_rew, prev_stim=prev_stim,
                                                                                prev_choice=prev_choice, input_period=input_period,
                                                                                batch_size=model.rnn.batch_size, n_steps=n_steps, 
                                                                                input_dim=model.rnn.n['input'], 
@@ -701,7 +824,7 @@ def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, 
                                                                                stim_end=ts_prev_stim_end, 
                                                                                dt=hp_copy['dt'])
             elif hp_copy['task']=='wcst':
-                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=last_rew, prev_stim=prev_stim, 
+                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=observed_last_rew, prev_stim=prev_stim,
                                                                                prev_choice=prev_choice, input_period=input_period,
                                                                                batch_size=model.rnn.batch_size, n_steps=n_steps, 
                                                                                input_dim=model.rnn.n['input'], 
@@ -709,7 +832,14 @@ def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, 
                                                                                stim_end=ts_prev_stim_end, 
                                                                                dt=hp_copy['dt'], choice_dim=3)
             I_prev_rew, I_prev_stim, I_prev_choice = I_prev_rew.to(device), I_prev_stim.to(device), I_prev_choice.to(device)
-            trial_history = {'i_prev_rew': I_prev_rew, 'i_prev_choice': I_prev_choice, 'i_prev_stim': I_prev_stim}
+            prev_rew_mag = hp_copy.get('prev_rew_mag', 1)
+            prev_stim_mag = hp_copy.get('prev_stim_mag', 1)
+            prev_choice_mag = hp_copy.get('prev_choice_mag', 1)
+            trial_history = {
+                'i_prev_rew': prev_rew_mag * I_prev_rew,
+                'i_prev_choice': prev_choice_mag * I_prev_choice,
+                'i_prev_stim': prev_stim_mag * I_prev_stim,
+            }
 #             print(I_prev_rew[:,0,:], I_prev_choice[:,0,:], I_prev_stim[:,0,:])
 #             print('I_prev_rew shape: {}'.format(I_prev_rew.shape))
             
@@ -1018,7 +1148,7 @@ def test_frozen_weights(model, n_trials_test, init_rule, hp, hp_task, loss_fnc, 
 
         data = {'y': y, 'yhat': yhat, 'y_rule': y_rule, 'yhat_rule': yhat_rule, 'rnn_activity': activity_list, 'noise': noise_list, 
                'rules': rule_list, 'stims': stim_list, 'resps': resp_list, 'perfs': perf_list_test, 'perf_rules': perf_rule_list_test,
-               'i_mes': i_me_list}
+               'i_mes': i_me_list, 'switch_trials': list(switch_trials), 'switch_mode': switch_mode}
         
         # print('performance: {}'.format(np.mean([_[0] for _ in data['perfs']])))
         

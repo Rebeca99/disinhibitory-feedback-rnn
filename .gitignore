@@ -1,0 +1,25 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+.venv/
+venv/
+.env
+
+*.log
+*.lock
+slurm-*.out
+
+# Generated experiment state and analyses
+outputs/
+results/
+evaluation_logs/
+training_check/
+publication_summary/
+*_summary/
+plan.json
+plan.preflight.json
+latest.pt
+final.pt
+

@@ -34,11 +34,94 @@ from model_working import *
 # %matplotlib inline
 
 
+DEFAULT_TRAINING_ROOT = os.environ.get('BIORNN_TRAINING_ROOT', '/scratch/yl4317/two_module_rnn')
+
+
+def get_training_paths(hp):
+    """Resolve output paths for local, cluster, or legacy scratch training."""
+    training_root = hp.get('training_root') or DEFAULT_TRAINING_ROOT
+    paths = {
+        'root': training_root,
+        'saved_models': hp.get('saved_models_dir') or os.path.join(training_root, 'saved_models'),
+        'saved_checkpoints': hp.get('saved_checkpoints_dir') or os.path.join(training_root, 'saved_checkpoints'),
+    }
+    for path in [paths['saved_models'], paths['saved_checkpoints']]:
+        os.makedirs(path, exist_ok=True)
+    return paths
+
+
+def configure_trainable_parameters(model, hp):
+    """Optionally freeze the pretrained backbone for feedback-route robustness tests.
+
+    The default mode leaves training unchanged. Frozen-backbone modes keep the
+    recurrent circuit and sensory input weights fixed after warm start, then
+    train only a small named subset of parameters.
+    """
+    mode = hp.get('freeze_backbone_mode', 'none')
+    if mode in [None, False, 'none']:
+        return
+
+    mode_to_prefixes = {
+        'feedback_only': ['rnn.w_rew'],
+        'readout_only': ['rnn.w_out', 'rnn.w_out_rule'],
+        'feedback_readout': ['rnn.w_rew', 'rnn.w_out', 'rnn.w_out_rule'],
+        'feedback_history_readout': [
+            'rnn.w_rew',
+            'rnn.w_prev_stim',
+            'rnn.w_prev_choice',
+            'rnn.w_out',
+            'rnn.w_out_rule',
+        ],
+    }
+    if mode not in mode_to_prefixes:
+        raise ValueError('unknown freeze_backbone_mode: {}'.format(mode))
+
+    trainable_prefixes = tuple(mode_to_prefixes[mode])
+    trainable_names = []
+    frozen_names = []
+    trainable_count = 0
+    frozen_count = 0
+
+    for name, param in model.named_parameters():
+        is_trainable = name.startswith(trainable_prefixes)
+        param.requires_grad = is_trainable
+        n_param = param.numel()
+        if is_trainable:
+            trainable_names.append(name)
+            trainable_count += n_param
+        else:
+            frozen_names.append(name)
+            frozen_count += n_param
+
+    if trainable_count == 0:
+        raise ValueError('freeze_backbone_mode={} left zero trainable parameters'.format(mode))
+
+    hp['freeze_backbone_trainable_names'] = trainable_names
+    hp['freeze_backbone_frozen_names'] = frozen_names
+    hp['freeze_backbone_trainable_param_count'] = int(trainable_count)
+    hp['freeze_backbone_frozen_param_count'] = int(frozen_count)
+
+    print(
+        'freeze_backbone_mode={}: trainable params={}, frozen params={}'.format(
+            mode,
+            trainable_count,
+            frozen_count,
+        ),
+        flush=True,
+    )
+    print('trainable parameter tensors: {}'.format(', '.join(trainable_names)), flush=True)
+
+
+def get_temp_hp_dir():
+    return os.environ.get('BIORNN_HP_DIR', os.path.join(DEFAULT_TRAINING_ROOT, 'sbatch', 'temp_hps'))
+
+
 
 def train_sbatch(jobname):
     hp, _, loss_fnc = get_default_hp()
     
-    with open('/scratch/yl4317/two_module_rnn/sbatch/temp_hps/{}_hp.pickle'.format(jobname), 'rb') as handle:
+    hp_path = os.path.join(get_temp_hp_dir(), '{}_hp.pickle'.format(jobname))
+    with open(hp_path, 'rb') as handle:
         custom_hp = pickle.load(handle)
         
     for key in custom_hp.keys():
@@ -46,13 +129,14 @@ def train_sbatch(jobname):
     print('Running job {}'.format(hp['jobname']))
     train_bpxtrials_v2_working(hp)
     
-    os.remove('/scratch/yl4317/two_module_rnn/sbatch/temp_hps/{}_hp.pickle'.format(jobname))
+    os.remove(hp_path)
     
     
 def not_train_sbatch(jobname):
     hp, _, loss_fnc = get_default_hp()
     
-    with open('/scratch/yl4317/two_module_rnn/sbatch/temp_hps/{}_hp.pickle'.format(jobname), 'rb') as handle:
+    hp_path = os.path.join(get_temp_hp_dir(), '{}_hp.pickle'.format(jobname))
+    with open(hp_path, 'rb') as handle:
         custom_hp = pickle.load(handle)
         
     for key in custom_hp.keys():
@@ -60,7 +144,7 @@ def not_train_sbatch(jobname):
     print('Running job {}'.format(hp['jobname']))
     save_random_models(hp)
     
-    os.remove('/scratch/yl4317/two_module_rnn/sbatch/temp_hps/{}_hp.pickle'.format(jobname))
+    os.remove(hp_path)
     
     
 
@@ -80,8 +164,8 @@ def train_bpxtrials_v2_working(hp):
 #     torch.use_deterministic_algorithms(True) 
     torch.backends.cudnn.deterministic = True 
     torch.manual_seed(hp['torch_seed'])
-    np.random.seed(0)
-    random.seed(0)
+    np.random.seed(hp['torch_seed'])
+    random.seed(hp['torch_seed'])
     
     # trace gradient
     torch.autograd.set_detect_anomaly(False)
@@ -110,15 +194,24 @@ def train_bpxtrials_v2_working(hp):
 
     # save_name = '{}_init={}_l2h={}_torchseed={}_lr={}_optim={}'.format(hp['jobname'], hp['initialization'], hp['l2_h'], hp['torch_seed'], hp['lr'], hp['optimizer'].__name__)
     hp['save_name'] = hp['jobname']
+    training_paths = get_training_paths(hp)
+    saved_models_dir = training_paths['saved_models']
+    saved_checkpoints_dir = training_paths['saved_checkpoints']
+    checkpoint_interval = hp.get('checkpoint_interval', 10)
+    max_train_batches = hp.get('max_train_batches', int(1e5))
+    max_runtime_seconds = hp.get('max_runtime_seconds', None)
+    warm_start_model_path = hp.get('warm_start_model_path', None)
+    warm_start_saved_data = None
+    print('training output root: {}\n'.format(training_paths['root']), flush=True)
     
     # if the model has reached convergence, exit
-    saved_models = [f for f in os.listdir('/scratch/yl4317/two_module_rnn/saved_models/') if hp['save_name'] in f]
+    saved_models = [f for f in os.listdir(saved_models_dir) if hp['save_name'] in f]
     if len(saved_models)!=0:
         print('found a model: {}, exit'.format(saved_models))
         return
     
     # check if there is a checkpoint
-    chkpt_files = [f for f in os.listdir('/scratch/yl4317/two_module_rnn/saved_checkpoints/') if 'chkpt' in f and hp['save_name'] in f]
+    chkpt_files = [f for f in os.listdir(saved_checkpoints_dir) if 'chkpt' in f and hp['save_name'] in f]
     if len(chkpt_files)==0:
         # no checkpoint
         print('no checkpoint, start a new training\n')
@@ -130,8 +223,25 @@ def train_bpxtrials_v2_working(hp):
             hp_task = get_default_hp_wcst()
         else:
             raise ValueError('{} task not implemented!'.format(hp['task']))
+        if warm_start_model_path is not None:
+            print('warm-starting from {}\n'.format(warm_start_model_path), flush=True)
+            warm_start_saved_data = torch.load(warm_start_model_path, map_location=device)
+            hp_task = warm_start_saved_data.get('hp_task', hp_task)
         model = Net_readoutSR_working(hp)
-        model.to(device); model.rnn.to(device)    
+        model.to(device); model.rnn.to(device)
+        if warm_start_saved_data is not None:
+            model.load_state_dict(warm_start_saved_data['model_state_dict'], strict=False)
+            model.rnn.apply_prev_rew_mask()
+            vip_feedback_init = float(hp.get('warm_start_vip_feedback_init', 0.0) or 0.0)
+            if hp.get('zero_warm_start_vip_feedback', False) or vip_feedback_init != 0:
+                with torch.no_grad():
+                    vip_feedback_rows = [1] if model.rnn.prev_rew_negative_only_to_vip==True else range(model.rnn.mask_rew.shape[0])
+                    for rew_row in vip_feedback_rows:
+                        if model.rnn.prev_rew_to_pfc_vip==True:
+                            model.rnn.w_rew[rew_row, model.rnn.cg_idx['pfc_vip']] = vip_feedback_init
+                        if model.rnn.prev_rew_to_sr_vip==True:
+                            model.rnn.w_rew[rew_row, model.rnn.cg_idx['sr_vip']] = vip_feedback_init
+        configure_trainable_parameters(model, hp)
        # model = SimpleNet_readoutSR(hp)    # simplified net
         if hp['optimizer']=='adam':  
             optimizer = torch.optim.Adam 
@@ -149,7 +259,7 @@ def train_bpxtrials_v2_working(hp):
 #         if torch.cuda.is_available():
 #             checkpoint = torch.load('/scratch/yl4317/two_module_rnn/saved_checkpoints/'+chkpt_files[0], map_location=device)
 #         else:
-        checkpoint = torch.load('/scratch/yl4317/two_module_rnn/saved_checkpoints/'+chkpt_files[0], map_location=device)
+        checkpoint = torch.load(os.path.join(saved_checkpoints_dir, chkpt_files[0]), map_location=device)
 #         checkpoint = chkpt_files[0]
         ba_start = int(checkpoint['step'])
         start_time = checkpoint['time']    # how long it has take
@@ -158,6 +268,8 @@ def train_bpxtrials_v2_working(hp):
         model = Net_readoutSR_working(hp)
         model.to(device); model.rnn.to(device)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        model.rnn.apply_prev_rew_mask()
+        configure_trainable_parameters(model, hp)
         if hp['optimizer']=='adam':  
             optimizer = torch.optim.Adam 
         elif hp['optimizer']=='SGD':  
@@ -232,16 +344,30 @@ def train_bpxtrials_v2_working(hp):
         rnn_activity_list = []
 
         # resetting network + curriculum learning
-        reset_network = False
-        give_prev_stim = True
-        give_prev_choice = True
-        give_prev_rew = True
-        curriculum = True    # curriculum learning: gradually remove trial history inputs
-        prev_stim_mag = 1
-        prev_choice_mag = 1
-        prev_rew_mag = 1
+        reset_network = hp.get('reset_network', False)
+        give_prev_stim = hp.get('give_prev_stim', True)
+        give_prev_choice = hp.get('give_prev_choice', True)
+        give_prev_rew = hp.get('give_prev_rew', True)
+        curriculum = hp.get('curriculum', True)    # curriculum learning: gradually remove trial history inputs
+        prev_stim_mag = hp.get('prev_stim_mag', 1)
+        prev_choice_mag = hp.get('prev_choice_mag', 1)
+        prev_rew_mag = hp.get('prev_rew_mag', 1)
         print('Reset network: {}, give_prev_stim: {}, give_prev_choice: {}, give_prev_rew: {}\n'.
               format(reset_network, give_prev_stim, give_prev_choice, give_prev_rew), flush=True)
+        if hp.get('feedback_noise_mode', 'none') not in ['none', None] and float(hp.get('feedback_noise_prob', 0.0) or 0.0) > 0:
+            print('Feedback noise: mode={}, prob={}, flip_fraction={}\n'.
+                  format(hp.get('feedback_noise_mode'), hp.get('feedback_noise_prob'), hp.get('feedback_noise_flip_fraction', 'n/a')), flush=True)
+        print('Feedback routing scales: pfc={}, vip={}, vip_init={}\n'.
+              format(hp.get('prev_rew_to_pfc_scale', 1.0), hp.get('prev_rew_to_vip_scale', 1.0), hp.get('warm_start_vip_feedback_init', 0.0)), flush=True)
+        print('Switching: train_mode={}, test_mode={}, train_min/max/p={}, test_min/max/p={}\n'.format(
+              hp.get('train_switch_mode', 'fixed_n'),
+              hp.get('test_switch_mode', 'fixed_interval'),
+              hp.get('stochastic_min_block_len', 'n/a'),
+              hp.get('stochastic_max_block_len', 'n/a'),
+              hp.get('stochastic_switch_prob', 'n/a'),
+              hp.get('test_stochastic_min_block_len', 'n/a'),
+              hp.get('test_stochastic_max_block_len', 'n/a'),
+              hp.get('test_stochastic_switch_prob', 'n/a')), flush=True)
         curriculum_t = False
         if curriculum_t==True:    # curriculum learning: gradually increase block length
             hp['block_len_n_swit_comb'] = [(20,2)]    # curriculum: gradually increase number of trials
@@ -251,9 +377,9 @@ def train_bpxtrials_v2_working(hp):
     elif len(chkpt_files)==1:
         # TODO
         if torch.cuda.is_available():
-            checkpoint = torch.load('/scratch/yl4317/two_module_rnn/saved_checkpoints/'+chkpt_files[0])
+            checkpoint = torch.load(os.path.join(saved_checkpoints_dir, chkpt_files[0]))
         else:
-            checkpoint = torch.load('/scratch/yl4317/two_module_rnn/saved_checkpoints/'+chkpt_files[0], map_location=torch.device('cpu'))
+            checkpoint = torch.load(os.path.join(saved_checkpoints_dir, chkpt_files[0]), map_location=torch.device('cpu'))
 #         checkpoint = chkpt_files[0]
         perf_list_big = checkpoint['perf_list']
         perf_rule_list_big = checkpoint['perf_rule_list']
@@ -274,7 +400,7 @@ def train_bpxtrials_v2_working(hp):
         prev_rew_mag = checkpoint['prev_rew_mag']
         print('Reset network: {}, give_prev_stim: {}, give_prev_choice: {}, give_prev_rew: {}\n'.
               format(reset_network, give_prev_stim, give_prev_choice, give_prev_rew), flush=True)
-        curriculum_t = [checkpoint['curriculum_t'] if 'curriculum_t' in checkpoint.keys() else False]
+        curriculum_t = checkpoint['curriculum_t'] if 'curriculum_t' in checkpoint.keys() else False
         if curriculum_t==True:    # curriculum learning: gradually increase block length (not used anymore)
             raise NotImplementedError
     elif len(chkpt_files)>1:
@@ -293,7 +419,18 @@ def train_bpxtrials_v2_working(hp):
         loss = 0
 
         block_len = hp['block_len'] + random.randint(0,0)    # test: variable block length
-        switches = random.sample(range(block_len-1), hp['n_switches'])
+        if hp.get('train_switch_mode', 'fixed_n') == 'stochastic_hazard':
+            first_new_rule_trials = sample_stochastic_switch_trials(
+                n_trials=block_len,
+                min_block_len=hp.get('stochastic_min_block_len', 10),
+                max_block_len=hp.get('stochastic_max_block_len', 35),
+                switch_prob=hp.get('stochastic_switch_prob', 0.08),
+            )
+            switches = [tr - 1 for tr in first_new_rule_trials if tr > 0]
+            n_switches_this_block = len(switches)
+        else:
+            switches = random.sample(range(block_len-1), hp['n_switches'])
+            n_switches_this_block = hp['n_switches']
 
         if hp['grad_remove_history']==True:
             if give_prev_stim==False:
@@ -372,14 +509,15 @@ def train_bpxtrials_v2_working(hp):
             input_period = np.arange(int(hp_task_var_delay['trial_history_start']/hp['dt']), int(hp_task_var_delay['trial_history_end']/hp['dt']))    # input period for the trial history info
             n_steps = (hp_task_var_delay['trial_end'] - hp_task_var_delay['trial_start'])//hp['dt']
             n_steps = int(n_steps)
+            observed_last_rew = apply_feedback_noise(last_rew, hp)
             if hp['task']=='cxtdm':
                 ts_prev_stim_start = hp_task_var_delay['stim_start']
                 ts_prev_stim_end = hp_task_var_delay['stim_end']
-                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=last_rew, prev_stim=prev_stim, prev_choice=prev_choice, input_period=input_period, batch_size=hp['batch_size'], n_steps=n_steps, input_dim=model.rnn.n['input'], stim_start=ts_prev_stim_start, stim_end=ts_prev_stim_end, dt=hp['dt'], choice_dim=2)    # each current is time*batch*feature
+                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=observed_last_rew, prev_stim=prev_stim, prev_choice=prev_choice, input_period=input_period, batch_size=hp['batch_size'], n_steps=n_steps, input_dim=model.rnn.n['input'], stim_start=ts_prev_stim_start, stim_end=ts_prev_stim_end, dt=hp['dt'], choice_dim=2)    # each current is time*batch*feature
             if hp['task']=='wcst':
                 ts_prev_stim_start = hp_task_var_delay['test_cards_on']    # here the center card is still shown
                 ts_prev_stim_end = hp_task_var_delay['test_cards_off']
-                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=last_rew, prev_stim=prev_stim, prev_choice=prev_choice, input_period=input_period, batch_size=hp['batch_size'], n_steps=n_steps, input_dim=model.rnn.n['input'], stim_start=ts_prev_stim_start, stim_end=ts_prev_stim_end, dt=hp['dt'], choice_dim=3)    # each current is time*batch*feature
+                I_prev_rew, I_prev_stim, I_prev_choice = compute_trial_history(last_rew=observed_last_rew, prev_stim=prev_stim, prev_choice=prev_choice, input_period=input_period, batch_size=hp['batch_size'], n_steps=n_steps, input_dim=model.rnn.n['input'], stim_start=ts_prev_stim_start, stim_end=ts_prev_stim_end, dt=hp['dt'], choice_dim=3)    # each current is time*batch*feature
             I_prev_rew, I_prev_stim, I_prev_choice = I_prev_rew.to(device), I_prev_stim.to(device), I_prev_choice.to(device)
             trial_history = {'i_prev_rew': prev_rew_mag*I_prev_rew, 'i_prev_choice': prev_choice_mag*I_prev_choice, 'i_prev_stim': prev_stim_mag*I_prev_stim}
 #             print('compute trial history input takes {:.2e}s, total time for this step = {:.2e}s'.format(time.time()-start_trialhistory, time.time()-start_step))
@@ -632,21 +770,24 @@ def train_bpxtrials_v2_working(hp):
                 plot_perf(perf_rule_list, title='performance (rule)', ylabel='performance (rule)')
                 
         # save checkpoint
-        if ba%10==0 and ba>0:
+        if checkpoint_interval is not None and checkpoint_interval>0 and ba%checkpoint_interval==0 and ba>0:
             print('saving checkpoint. name={}_{}'.format('chkpt', hp['save_name']))
             saved_file = saved_file = {'step': ba, 'time': time.time()-start+start_time, 'model': model, 'model_state_dict': model.state_dict(), 'optimizer': optim, 'optim_state_dict': optim.state_dict(), 'hp': hp, 'hp_task': hp_task, 'perf_list':perf_list_big, 'perf_rule_list': perf_rule_list_big, 'loss_list': loss_list_big,'test_perf_list': test_perf_list_big, 'test_perf_rule_list': test_perf_rule_list_big, 'test_loss_list': test_loss_list_big, 'reset_network': reset_network, 'give_prev_stim': give_prev_stim, 'give_prev_choice': give_prev_choice, 'give_prev_rew': give_prev_rew, 'curriculum': curriculum, 'prev_stim_mag': prev_stim_mag, 'prev_choice_mag': prev_choice_mag, 'prev_rew_mag': prev_rew_mag}
-            torch.save(saved_file, '/scratch/yl4317/two_module_rnn/saved_checkpoints/{}_{}'.format('chkpt', hp['save_name'][:150]))     # save a copy in scratch
+            torch.save(saved_file, os.path.join(saved_checkpoints_dir, '{}_{}'.format('chkpt', hp['save_name'][:150])))     # save a checkpoint
 
             
         # testing
-        perf_crit_train = 1-hp['n_switches']/hp['block_len']-0.2    # performance criteria
+        perf_crit_train = 1-n_switches_this_block/block_len-0.2    # performance criteria
         mean_recent_perf = np.mean(perf_list_big[-1:])
         mean_recent_perf_rule = np.mean(perf_rule_list_big[-1:])  
         if mean_recent_perf>= perf_crit_train and mean_recent_perf_rule>=perf_crit_train:
             print('\nStep {}, perf: {:.4f}/{:.4f}, criteria for begin testing: {:.4f}. \n Start testing...........'.format(ba, mean_recent_perf, mean_recent_perf_rule, perf_crit_train), flush=True)
-            n_trials_test = 200
-            switch_every_test = 20
-            max_perf_test = 1-1/switch_every_test
+            n_trials_test = hp.get('test_n_trials', 200)
+            switch_every_test = hp.get('test_switch_every', 20)
+            if hp.get('test_switch_mode', 'fixed_interval') == 'stochastic_hazard':
+                max_perf_test = 1 - 1 / max(1, int(hp.get('test_stochastic_min_block_len', 10)))
+            else:
+                max_perf_test = 1-1/switch_every_test
             if hp['n_switches']<2:
                 print('\n<2 switches during training. Therefore skip testing\n', flush=True)
                 perf_test = 1
@@ -667,7 +808,10 @@ def train_bpxtrials_v2_working(hp):
                                                                               give_prev_rew=give_prev_rew, 
                                                                               give_prev_stim=give_prev_stim, 
                                                                               give_prev_choice=give_prev_choice,
-                                                                              noiseless=False)
+                                                                              noiseless=False,
+                                                                              switch_mode=hp.get('test_switch_mode', 'fixed_interval'))
+                if 'switch_trials' in _.keys():
+                    max_perf_test = 1 - len(_['switch_trials']) / n_trials_test
 #                     _, _, _, test_data = test_frozen_weights(model=model, n_trials_test=n_trials_test, switch_every_test=switch_every_test, 
 #                                              init_rule=random.choice(rule_list), hp=hp_test, task=task,
 #                                              loss_fnc=nn.MSELoss(), hp_task=hp_task_test,
@@ -729,7 +873,7 @@ def train_bpxtrials_v2_working(hp):
                             break
 
 
-        if ba>=1e5:    
+        if max_train_batches is not None and ba>=max_train_batches:
             print('Does not converge after too many batches. Training ends.', flush=True)
             success = 'noConverge'
             break
@@ -743,13 +887,17 @@ def train_bpxtrials_v2_working(hp):
 #             success = 'timesup'
 #             print('Time is up!')
 #             break
+        elif max_runtime_seconds is not None and time.time()-start+start_time>=max_runtime_seconds:
+            success = 'timesup'
+            print('Time limit reached. Training ends.', flush=True)
+            break
         
         
     # save at the end of training       
     print('saving model. name={}_{} ... \n'.format(success, hp['save_name']))
     saved_file = {'model': model, 'rnn_activity_lastk': rnn_activity_list, 'model_state_dict': model.state_dict(), 'optimizer': optim, 'optim_state_dict': optim.state_dict(), 'hp': hp, 'hp_task': hp_task, 'perf_list':perf_list_big, 'perf_rule_list': perf_rule_list_big, 'loss_list': loss_list_big,'test_perf_list': test_perf_list_big, 'test_perf_rule_list': test_perf_rule_list_big, 'test_loss_list': test_loss_list_big}
 #         torch.save(saved_file, '/home/yl4317/Documents/two_module_rnn/saved_models/{}_{}'.format(success, save_name[:150]))  
-    torch.save(saved_file, '/scratch/yl4317/two_module_rnn/saved_models/{}_{}'.format(success, hp['save_name'][:150]))     # save a copy in scratch
+    torch.save(saved_file, os.path.join(saved_models_dir, '{}_{}'.format(success, hp['save_name'][:150])))     # save final model
     
 
     

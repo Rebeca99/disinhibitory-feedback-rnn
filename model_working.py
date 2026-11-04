@@ -58,6 +58,13 @@ class BioRNN_working(torch.nn.Module):
         self.structured_sr_sst_to_sr_edend_branch_specific = hp['structured_sr_sst_to_sr_edend_branch_specific']
         self.sr_sst_high_bias = hp['sr_sst_high_bias']
         self.fdbk_to_vip = hp['fdbk_to_vip']
+        self.prev_rew_to_pfc_default = hp.get('prev_rew_to_pfc_default', True)
+        self.prev_rew_to_pfc_vip = hp.get('prev_rew_to_pfc_vip', False)
+        self.prev_rew_to_sr_vip = hp.get('prev_rew_to_sr_vip', False)
+        self.prev_rew_negative_only_to_vip = hp.get('prev_rew_negative_only_to_vip', False)
+        self.prev_rew_to_pfc_scale = hp.get('prev_rew_to_pfc_scale', 1.0)
+        self.prev_rew_to_vip_scale = hp.get('prev_rew_to_vip_scale', 1.0)
+        self.allow_zero_prev_rew_targets = hp.get('allow_zero_prev_rew_targets', False)
         self.dend_nonlinearity = hp['dend_nonlinearity']
         self.trainable_dend2soma = hp['trainable_dend2soma']
 #         self.divisive_dend_inh = hp['divisive_dend_inh']
@@ -314,11 +321,7 @@ class BioRNN_working(torch.nn.Module):
         # set weights for reward on previous trial
         self.w_rew = nn.Parameter(torch.Tensor(2, self.total_n_neurons), requires_grad=True)
         self.mask_rew = nn.Parameter(torch.zeros(2, self.total_n_neurons), requires_grad=False)
-        if self.fdbk_to_vip==True:
-            print('feedback only targets PFC VIP cells\n')
-            self.mask_rew[:, self.cg_idx['pfc_vip']] = 1    # reward targets VIP
-        else:
-            self.mask_rew[:, self.input_targ_idx_pfc] = 1    # reward information feeds into PFC only.
+        self.apply_prev_rew_mask()
         
     
         # set weights for stimulus on previous trial
@@ -540,6 +543,31 @@ class BioRNN_working(torch.nn.Module):
                 print('{} to {}: {}'.format(cg1, cg2, torch.mean(self.mask.data(np.ix_(self.cg_idx[cg1], self.cg_idx[cg2])))))
      
     
+    def apply_prev_rew_mask(self):
+        """Apply the configured previous-reward routing mask."""
+        pfc_scale = float(self.prev_rew_to_pfc_scale)
+        vip_scale = float(self.prev_rew_to_vip_scale)
+        if pfc_scale < 0 or vip_scale < 0:
+            raise ValueError('previous reward feedback scales must be non-negative')
+
+        with torch.no_grad():
+            self.mask_rew.zero_()
+            if self.fdbk_to_vip==True:
+                print('feedback only targets PFC VIP cells\n')
+                self.mask_rew[:, self.cg_idx['pfc_vip']] = vip_scale    # reward targets VIP
+            else:
+                if self.prev_rew_to_pfc_default==True:
+                    self.mask_rew[:, self.input_targ_idx_pfc] = pfc_scale    # reward information feeds into PFC only.
+                vip_feedback_rows = [1] if self.prev_rew_negative_only_to_vip==True else range(self.mask_rew.shape[0])
+                for rew_row in vip_feedback_rows:
+                    if self.prev_rew_to_pfc_vip==True:
+                        self.mask_rew[rew_row, self.cg_idx['pfc_vip']] = vip_scale
+                    if self.prev_rew_to_sr_vip==True:
+                        self.mask_rew[rew_row, self.cg_idx['sr_vip']] = vip_scale
+            if self.mask_rew.sum().item()==0 and self.allow_zero_prev_rew_targets==False:
+                raise ValueError('previous reward feedback must target at least one population')
+
+
     def nonlinearity_soma(self, input_current, nonlinearity, k_relu_satu=10):
         """ somatic nonlinearity """
 
@@ -654,12 +682,12 @@ class BioRNN_working(torch.nn.Module):
 #         print(dend_current)
 
 
+        else:
+            raise ValueError('Dendritic nonlinearity not recognized: {}'.format(nonlinearity))
+
         return dend_current
-    
-    
-    
-        
-        
+
+
     def effective_weight(self, w, mask, w_fix=0):
         """ compute the effective weight """
     

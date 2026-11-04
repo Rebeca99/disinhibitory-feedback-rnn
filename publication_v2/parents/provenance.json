@@ -1,0 +1,24 @@
+[
+  {
+    "filename": "parent_01_wcst_6.pt",
+    "sha256": "dbfa23b1733fd2897ee20aab332c636bf3f2597d2cd5347034b939c99dc121e1",
+    "source": {
+      "id": "parent_01",
+      "parameter_sha256": "3c4381e8f17228a3fa43d419461d65c3601a10076cc1c8d44fd21b14ccb6938c",
+      "sha256": "379f08a2a50e53b378daef05a6e69246f392387e3495fba7aba9630a59339477",
+      "source_name": "success_2023-05-01-09-44-09_wcst_17_final_maybe",
+      "source_training_seed": 6
+    }
+  },
+  {
+    "filename": "parent_02_wcst_7.pt",
+    "sha256": "59e0dc2a835ebbd53ca4c351368630ac5d1fd0a57ee61e8c0904dbaf4d3379eb",
+    "source": {
+      "id": "parent_02",
+      "parameter_sha256": "a7f2fbc968d757e53dfa7511d068e48d18af192ae3ff5a282bd2165a533ec9b4",
+      "sha256": "c24733009fc41c54c0d69596ba42c83d64172b179221766c11ea7cd461d7b762",
+      "source_name": "success_2023-05-01-09-44-09_wcst_18_final_maybe",
+      "source_training_seed": 7
+    }
+  }
+]
